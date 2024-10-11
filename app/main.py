@@ -145,7 +145,7 @@ async def get_latest_reviews(n: int = 5):
         Review(
             id=row["publishedAtDate"],
             name=row["name"],
-            published_at=row["publishAt"],
+            published_at=row["publishedAtDate"],
             text=row["originalText"] if pd.notna(row["originalText"]) else None,
             rating=row["stars"],
             image_url=row["reviewerPhotoUrl"]
