@@ -1,0 +1,7 @@
+# Ignore all secret CSV files 
+*-secret.csv
+
+.venv
+
+__pycache__
+*.pyc
