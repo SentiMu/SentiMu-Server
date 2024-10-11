@@ -13,13 +13,18 @@ from functools import wraps
 
 app = FastAPI()
 
-# Redis setup
-redis_client = redis.Redis(
-    host='localhost',  # Change if Redis is on a different host
-    port=6379,        # Default Redis port
-    db=0,             # Default Redis database
-    decode_responses=True  # Automatically decode responses to Python strings
-)
+# Add error handling for Redis connection at startup
+try:
+    redis_client = redis.Redis(
+        host='localhost',
+        port=6379,
+        db=0,
+        decode_responses=True
+    )
+    redis_client.ping()  # Test the connection
+except redis.ConnectionError:
+    print("Failed to connect to Redis. Make sure Redis is running!")
+    redis_client = None
 
 # Cache expiration times (in seconds)
 CACHE_EXPIRATION = {
@@ -119,13 +124,13 @@ def redis_cache(cache_key: str, expiration_key: str):
 @app.get("/total-score", response_model=ScoreResponse)
 @redis_cache("total_score", "total_score")
 async def get_total_score():
-    total_score = df['totalScore'].head(1).values[0]
+    total_score = int(df['totalScore'].head(1).values[0])
     return {"total_score": total_score}
 
 @app.get("/reviews-count", response_model=CountResponse)
 @redis_cache("reviews_count", "reviews_count")
 async def get_reviews_count():
-    count = df['reviewsCount'].head(1).values[0]
+    count = int(df['reviewsCount'].head(1).values[0])
     return {"reviews_count": count}
 
 @app.get("/latest-reviews/{n}", response_model=ReviewsResponse)
