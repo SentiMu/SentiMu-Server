@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import pandas as pd
-from utils.data import determine_review_status
+from utils.data import determine_review_status, generate_month_numbers, generate_month_categories
 from sklearn.feature_extraction.text import CountVectorizer
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
@@ -30,10 +31,11 @@ except redis.ConnectionError:
 CACHE_EXPIRATION = {
     'total_score': 600,         # 10 minutes
     'reviews_count': 600,       # 10 minutes
-    'latest_reviews': 600,      # 10 minutes
-    'duplicate_reviews': 600,   # 10 minutes
-    'word_cloud': 600,          # 10 minutes
     'overview': 600,            # 10 minutes
+    'time_series': 600,         # 10 minutes
+    'latest_reviews': 600,      # 10 minutes
+    'word_cloud': 600,          # 10 minutes
+    'duplicate_reviews': 600,   # 10 minutes
 }
 
 # CORS setup remains the same
@@ -55,6 +57,28 @@ df = pd.read_csv('cleaned_dataset-secret.csv')
 label_id = {'LABEL_0': 'positive', 'LABEL_1': 'neutral', 'LABEL_2': 'negative'}
 
 # Pydantic models remain the same as in your original code
+
+class ScoreResponse(BaseModel):
+    total_score: float
+
+class CountResponse(BaseModel):
+    reviews_count: int
+
+class OverviewData(BaseModel):
+    positive: float
+    negative: float
+    neutral: float
+
+class OverviewResponse(BaseModel):
+    status: OverviewData
+
+class TimeSeriesData(BaseModel):
+    name: str
+    data: List[int]
+
+class TimeSeriesResponse(BaseModel):
+    time_series: List[TimeSeriesData]
+
 class Review(BaseModel):
     id: Optional[str]
     name: str
@@ -66,23 +90,6 @@ class Review(BaseModel):
 class ReviewsResponse(BaseModel):
     reviews: List[Review]
 
-class ScoreResponse(BaseModel):
-    total_score: float
-
-class CountResponse(BaseModel):
-    reviews_count: int
-
-class DuplicateReview(BaseModel):
-    name: str
-    review_count: int
-    latest_review_date: Optional[str]
-    status: Optional[str]
-    image_url: Optional[str]
-    reviews: List[Review]
-
-class DuplicateReviewsResponse(BaseModel):
-    duplicate_reviewers: List[DuplicateReview]
-
 class WordCloudData(BaseModel):
     x: str
     y: int
@@ -91,13 +98,16 @@ class WordCloudData(BaseModel):
 class WordCloudResponse(BaseModel):
     word_cloud: List[WordCloudData]
 
-class OverviewData(BaseModel):
-    positive: float
-    negative: float
-    neutral: float
+class DuplicateReviewData(BaseModel):
+    name: str
+    review_count: int
+    latest_review_date: Optional[str]
+    status: Optional[str]
+    image_url: Optional[str]
+    reviews: List[Review]
 
-class OverviewResponse(BaseModel):
-    status: OverviewData
+class DuplicateReviewsResponse(BaseModel):
+    duplicate_reviewers: List[DuplicateReviewData]
 
 # Cache decorator
 def redis_cache(cache_key: str, expiration_key: str):
@@ -289,7 +299,86 @@ async def get_overview():
         }
     }
 
+@app.get("/time-series", response_model=TimeSeriesResponse)
+@redis_cache("time_series", "time_series")
+async def get_time_series():
+    data = {
+        "Positive Review": [0] * 12,
+        "Negative Review": [0] * 12,
+        "Neutral Review": [0] * 12
+    }
+
+    temp_df = df.copy()
+    temp_df['publishedAtDate'] = pd.to_datetime(temp_df['publishedAtDate'])
+
+    # Get the current date
+    current_date = pd.Timestamp.now()
+
+    # Loop through the last 12 months, starting from the current month
+    for i in range(12):
+        # Calculate the month and year we are currently working with
+        target_date = current_date - pd.DateOffset(months=i)
+        target_year = target_date.year
+        target_month = target_date.month
+
+        # Filter the dataframe by both the target month and target year
+        month_df = temp_df[
+            (temp_df['publishedAtDate'].dt.year == target_year) &
+            (temp_df['publishedAtDate'].dt.month == target_month)
+        ]
+
+        # Get the count of each review status
+        status_counts = month_df['status'].value_counts()
+
+        # Update the data dictionary with actual counts
+        data["Positive Review"][11 - i] = status_counts.get('positive', 0)
+        data["Negative Review"][11 - i] = status_counts.get('negative', 0)
+        data["Neutral Review"][11 - i] = status_counts.get('neutral', 0)
+
+    time_series_data = [
+        TimeSeriesData(
+            name=name, 
+            data=[int(x) for x in data[name]]
+        ).model_dump()
+        for name in data.keys()
+    ]
+
+    return {"time_series": time_series_data}
+
+
+
+# @app.get("/time-series", response_model=TimeSeriesResponse)
+# @redis_cache("time_series", "time_series")
+# async def get_time_series():
+#     data = {
+#         "Positive Review": [0] * 12,
+#         "Negative Review": [0] * 12,
+#         "Neutral Review": [0] * 12
+#     }
+
+#     temp_df = df.copy()
+#     temp_df['publishedAtDate'] = pd.to_datetime(temp_df['publishedAtDate'])
+
+#     # only take total score based on generate_month_numbers (current month and 11 months before)
+#     for i, month in enumerate(generate_month_numbers()):
+#         month_df = temp_df[temp_df['publishedAtDate'].dt.month == month]
+#         status_counts = month_df['status'].value_counts(normalize=False)
+
+#         data["Positive Review"][i] = status_counts.get('positive', 0)
+#         data["Negative Review"][i] = status_counts.get('negative', 0)
+#         data["Neutral Review"][i] = status_counts.get('neutral', 0)
+
+#     time_series_data = [
+#         TimeSeriesData(
+#             name=name, 
+#             data=[int(x) for x in data[name]]
+#         ).model_dump()
+#         for name in data.keys()
+#     ]
+
+#     return {"time_series": time_series_data}
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
