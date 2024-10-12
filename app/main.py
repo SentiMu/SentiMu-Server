@@ -124,7 +124,7 @@ def redis_cache(cache_key: str, expiration_key: str):
 @app.get("/total-score", response_model=ScoreResponse)
 @redis_cache("total_score", "total_score")
 async def get_total_score():
-    total_score = int(df['totalScore'].head(1).values[0])
+    total_score = float(df['totalScore'].head(1).values[0])
     return {"total_score": total_score}
 
 @app.get("/reviews-count", response_model=CountResponse)
