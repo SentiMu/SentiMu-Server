@@ -28,11 +28,12 @@ except redis.ConnectionError:
 
 # Cache expiration times (in seconds)
 CACHE_EXPIRATION = {
-    'total_score': 3600,        # 1 hour
-    'reviews_count': 3600,      # 1 hour
-    'latest_reviews': 300,      # 5 minutes
-    'duplicate_reviews': 1800,  # 30 minutes
-    'word_cloud': 1800,         # 30 minutes
+    'total_score': 600,         # 10 minutes
+    'reviews_count': 600,       # 10 minutes
+    'latest_reviews': 600,      # 10 minutes
+    'duplicate_reviews': 600,   # 10 minutes
+    'word_cloud': 600,          # 10 minutes
+    'overview': 600,            # 10 minutes
 }
 
 # CORS setup remains the same
@@ -89,6 +90,14 @@ class WordCloudData(BaseModel):
 
 class WordCloudResponse(BaseModel):
     word_cloud: List[WordCloudData]
+
+class OverviewData(BaseModel):
+    positive: float
+    negative: float
+    neutral: float
+
+class OverviewResponse(BaseModel):
+    status: OverviewData
 
 # Cache decorator
 def redis_cache(cache_key: str, expiration_key: str):
@@ -261,6 +270,25 @@ async def get_word_cloud_data(targeted_word: Optional[str] = None):
     ]
     
     return {"word_cloud": word_cloud_data}
+
+@app.get("/overview", response_model=OverviewResponse)
+@redis_cache("overview", "overview")
+async def get_overview():
+    # Get normalized value counts once
+    status_counts = df['status'].value_counts(normalize=True)
+
+    positive = round(status_counts.get('positive', 0) * 100, 2)
+    negative = round(status_counts.get('negative', 0) * 100, 2)
+    neutral = round(status_counts.get('neutral', 0) * 100, 2)
+
+    return {
+        "status": {
+            "positive": positive,
+            "negative": negative,
+            "neutral": neutral
+        }
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
