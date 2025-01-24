@@ -1,16 +1,26 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 import pandas as pd
-from utils.data import determine_review_status, generate_month_numbers, generate_month_categories
+from dateutil import parser
+from utils.data import determine_user_review_status
 from sklearn.feature_extraction.text import CountVectorizer
-from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 import redis
 import json
 from functools import wraps
+from models import (
+    ScoreResponse,
+    CountResponse,
+    OverviewResponse,
+    TimeSeriesData,
+    TimeSeriesResponse,
+    Review,
+    ReviewsResponse,
+    WordCloudResponse,
+    DuplicateReviewsResponse,
+    TargetedWordRequest,
+)
 
 app = FastAPI()
 
@@ -29,13 +39,13 @@ except redis.ConnectionError:
 
 # Cache expiration times (in seconds)
 CACHE_EXPIRATION = {
-    'total_score': 600,         # 10 minutes
-    'reviews_count': 600,       # 10 minutes
-    'overview': 600,            # 10 minutes
-    'time_series': 600,         # 10 minutes
-    'latest_reviews': 600,      # 10 minutes
-    'word_cloud': 600,          # 10 minutes
-    'duplicate_reviews': 600,   # 10 minutes
+    'total_score': 6,         # 10 minutes
+    'reviews_count': 6,       # 10 minutes
+    'overview': 6,            # 10 minutes
+    'time_series': 6,         # 10 minutes
+    'latest_reviews': 6,      # 10 minutes
+    'word_cloud': 6,          # 10 minutes
+    'duplicate_reviews': 6,   # 10 minutes
 }
 
 # CORS setup remains the same
@@ -53,61 +63,14 @@ app.add_middleware(
 )
 
 # Load the DataFrame
-df = pd.read_csv('cleaned_dataset-secret.csv')
-label_id = {'LABEL_0': 'positive', 'LABEL_1': 'neutral', 'LABEL_2': 'negative'}
+df = pd.read_csv('dataset-secret.csv')
 
-# Pydantic models remain the same as in your original code
-
-class ScoreResponse(BaseModel):
-    total_score: float
-
-class CountResponse(BaseModel):
-    reviews_count: int
-
-class OverviewData(BaseModel):
-    positive: float
-    negative: float
-    neutral: float
-
-class OverviewResponse(BaseModel):
-    status: OverviewData
-
-class TimeSeriesData(BaseModel):
-    name: str
-    data: List[int]
-
-class TimeSeriesResponse(BaseModel):
-    time_series: List[TimeSeriesData]
-
-class Review(BaseModel):
-    id: Optional[str]
-    name: str
-    published_at: str
-    text: Optional[str]
-    rating: Optional[float]
-    image_url: Optional[str]
-
-class ReviewsResponse(BaseModel):
-    reviews: List[Review]
-
-class WordCloudData(BaseModel):
-    x: str
-    y: int
-    color: Optional[str]
-
-class WordCloudResponse(BaseModel):
-    word_cloud: List[WordCloudData]
-
-class DuplicateReviewData(BaseModel):
-    name: str
-    review_count: int
-    latest_review_date: Optional[str]
-    status: Optional[str]
-    image_url: Optional[str]
-    reviews: List[Review]
-
-class DuplicateReviewsResponse(BaseModel):
-    duplicate_reviewers: List[DuplicateReviewData]
+# Define stopwords 
+STOPWORDS = {"the", "yang", "di", "dan", "ada", "and", "is", "in", "of", "to", "untuk", "dari", "dengan", "yg", "ada", "ini", "atau", "lebih", "menjadi",
+            "itu", "saya", "kami", "anda", "mereka", "dia", "aku", "kau", "ia", "kita", "anda", "orang", "akan", "telah", "pun", "tapi", "bisa", "gaes",
+            "juga", "lagi", "sudah", "masih", "sekarang", "sementara", "ketika", "kalau", "jika", "seolah", "seolah-olah", "seakan", "karena", "klo", "luas",
+            "seakan-akan", "bagi", "ke", "kepada", "oleh", "sangat","banyak", "sedikit", "beberapa", "setiap", "semua", "seluruh", "seperti", "buat", "nya",
+            "tidak", "tak", "bukan", "jangan", "enggak", "gak", "tidaklah", "takkan", "takboleh", "boleh", "harus", "mesti", "perlu", "ya", "sampai", "lain"}
 
 # Cache decorator
 def redis_cache(cache_key: str, expiration_key: str):
@@ -139,81 +102,122 @@ def redis_cache(cache_key: str, expiration_key: str):
         return wrapper
     return decorator
 
+# Placeholder for global targeted word
+targeted_word: Optional[str] = None
+
 # Modified API endpoints with Redis caching
+@app.post("/set-target-word")
+async def set_target_word(request: TargetedWordRequest):
+    global targeted_word
+    targeted_word = request.word
+    return {"message": f"Target word '{targeted_word}' set successfully."}
+
+@app.get("/get-target-word")
+async def get_target_word():
+    global targeted_word
+    if targeted_word:
+        return {"target_word": targeted_word}
+    return {"message": "No target word has been set yet."}
+
+def filter_reviews_by_targeted_word(df, targeted_word):
+    if targeted_word:
+        return df[df['text'].str.contains(targeted_word, na=False, case=False)]
+    return df
+
 @app.get("/total-score", response_model=ScoreResponse)
 @redis_cache("total_score", "total_score")
 async def get_total_score():
-    total_score = float(df['totalScore'].head(1).values[0])
+    global targeted_word
+    filtered_df = filter_reviews_by_targeted_word(df, targeted_word)
+
+    if filtered_df.empty:
+        raise HTTPException(status_code=404, detail=f"No reviews found for the targeted word '{targeted_word}'.")
+
+    total_score = round(filtered_df['stars'].mean(), 2)
     return {"total_score": total_score}
 
 @app.get("/reviews-count", response_model=CountResponse)
 @redis_cache("reviews_count", "reviews_count")
 async def get_reviews_count():
-    count = int(df['reviewsCount'].head(1).values[0])
+    global targeted_word
+    filtered_df = filter_reviews_by_targeted_word(df, targeted_word)
+    
+    if filtered_df.empty:
+        raise HTTPException(status_code=404, detail=f"No reviews found for the targeted word '{targeted_word}'.")
+    
+    count = len(filtered_df)
     return {"reviews_count": count}
 
-@app.get("/latest-reviews/{n}", response_model=ReviewsResponse)
+@app.get("/latest-reviews", response_model=ReviewsResponse)
 @redis_cache("latest_reviews", "latest_reviews")
-async def get_latest_reviews(n: int = 5):
-    if n < 1:
-        raise HTTPException(status_code=400, detail="Number of reviews must be at least 1")
-    
-    latest_reviews = df.sort_values(by='publishedAtDate', ascending=False).head(n)
-    
+async def get_latest_reviews():
+    global targeted_word
+    filtered_df = filter_reviews_by_targeted_word(df, targeted_word)
+    latest_reviews = filtered_df.sort_values(by='publishedAtDate', ascending=False).head(5)
+
     reviews_list = [
         Review(
-            id=row["publishedAtDate"],
+            id=str(row["publishedAtDate"]),
             name=row["name"],
-            published_at=row["publishedAtDate"],
-            text=row["originalText"] if pd.notna(row["originalText"]) else None,
+            published_at=str(row["publishedAtDate"]),
+            text=row["text"] if pd.notna(row["text"]) else None,
             rating=row["stars"],
             image_url=row["reviewerPhotoUrl"]
         ).model_dump()
         for _, row in latest_reviews.iterrows()
     ]
-    
+
     return {"reviews": reviews_list}
+
 
 @app.get("/duplicate-reviews", response_model=DuplicateReviewsResponse)
 @redis_cache("duplicate_reviews", "duplicate_reviews")
 async def get_duplicated_reviews():
-    duplicate_reviewers = df['name'].value_counts()
+    global targeted_word
+
+    filtered_df = filter_reviews_by_targeted_word(df, targeted_word)
+
+    # find user with duplicate reviews
+    duplicate_reviewers = filtered_df['name'].value_counts()
     duplicate_reviewers = duplicate_reviewers[duplicate_reviewers > 1]
-    
+
     result = []
-    
+
     for name, count in duplicate_reviewers.items():
-        user_reviews = df[df['name'] == name].sort_values(by='publishedAtDate', ascending=False)
+        user_reviews = filtered_df[filtered_df['name'] == name].sort_values(by='publishedAtDate', ascending=False)
         latest_review_date = user_reviews['publishedAtDate'].iloc[0]
-        
+
         reviews_list = [
             Review(
-                id=str(row["publishedAtDate"]),
+                id=f"{row['name']}_{row['publishedAtDate']}",
                 name=row["name"],
                 published_at=str(row["publishedAtDate"]),
-                text=row["originalText"] if pd.notna(row["originalText"]) else None,
+                text=row["text"] if pd.notna(row["text"]) else None,
                 rating=row["stars"],
                 image_url=row["reviewerPhotoUrl"]
             ).model_dump()
             for _, row in user_reviews.iterrows()
         ]
-        
-        status = determine_review_status(user_reviews)
-        
+
+        # Determine the status for the user's reviews
+        status = determine_user_review_status(user_reviews)
+
         result.append({
             "name": name,
             "review_count": count,
             "latest_review_date": str(latest_review_date),
             "image_url": user_reviews['reviewerPhotoUrl'].iloc[0],
-            "status": status.value,
-            "reviews": sorted(reviews_list, key=lambda x: x['published_at'], reverse=True)
+            "status": status['status'],
+            "reasons": status['reasons'],
+            "reviews": sorted(reviews_list, key=lambda x: x['published_at'], reverse=True),
         })
-    
+
+    # Sort by review count and latest review date
     sorted_result = sorted(
         result,
         key=lambda x: (
-            x["review_count"],
-            datetime.strptime(x["latest_review_date"], "%Y-%m-%dT%H:%M:%S.%fZ")
+            x.get("review_count", 0),
+            parser.isoparse(x.get("latest_review_date", "1970-01-01T00:00:00.000000Z"))
         ),
         reverse=True
     )
@@ -222,45 +226,56 @@ async def get_duplicated_reviews():
 
 @app.get("/word-cloud/", response_model=WordCloudResponse)
 @redis_cache("word_cloud", "word_cloud")
-async def get_word_cloud_data(targeted_word: Optional[str] = None):
-    filtered_texts = df['Text'].dropna()
-    
-    if targeted_word:
-        filtered_texts = filtered_texts[filtered_texts.str.lower().str.contains(targeted_word.lower(), na=False)]
-        
+async def get_word_cloud_data():
+    global targeted_word
+
+    filtered_df = filter_reviews_by_targeted_word(df, targeted_word)
+    filtered_texts = filtered_df['cleanedText'].dropna()
+
     if filtered_texts.empty:
-        return {"word_cloud": []}
-    
+        return {
+            "word_cloud": [
+                {
+                    "x": f"Not Enough Data for {targeted_word}" if targeted_word else "Not Enough Data",
+                    "y": 1,
+                    "color": "#7D8998",
+                }
+            ]
+        }
+
+    def remove_stopwords(text):
+        words = text.split()
+        return " ".join([word for word in words if word.lower() not in STOPWORDS])
+
+    filtered_texts = filtered_texts.apply(remove_stopwords)
+
+    # create a word count vectorizer
     vectorizer = CountVectorizer()
     X = vectorizer.fit_transform(filtered_texts)
-    
+
+    # calculate word frequencies
     word_counts = dict(zip(vectorizer.get_feature_names_out(), X.sum(axis=0).tolist()[0]))
     sorted_word_counts = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:10]
 
-    pretrained_id = "mdhugol/indonesia-bert-sentiment-classification"
+    # sentiment analysis setup
+    pretrained_id = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
     tokenizer = AutoTokenizer.from_pretrained(pretrained_id)
     model = AutoModelForSequenceClassification.from_pretrained(pretrained_id)
     sentiment_analysis = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer)
 
+    # helper function to find example sentences
     def find_example_sentences(word, texts, max_examples=5):
-        examples = []
-        for text in texts:
-            if word.lower() in text.lower():
-                examples.append(text)
-                if len(examples) >= max_examples:
-                    break
-        return examples
+        return [text for text in texts if word.lower() in text.lower()][:max_examples]
 
+    # calculate word sentiments
     word_sentiments = {}
     for word, _ in sorted_word_counts:
         example_sentences = find_example_sentences(word, filtered_texts)
-        
         if example_sentences:
-            sentiments = [label_id[sentiment_analysis(sentence)[0]['label']] for sentence in example_sentences]
-            
+            sentiments = [sentiment_analysis(sentence)[0]['label'] for sentence in example_sentences]
             pos_count = sentiments.count('positive')
             neg_count = sentiments.count('negative')
-            
+
             if pos_count > neg_count:
                 word_sentiments[word] = '#69AE34'
             elif neg_count > pos_count:
@@ -270,22 +285,23 @@ async def get_word_cloud_data(targeted_word: Optional[str] = None):
         else:
             word_sentiments[word] = '#7D8998'
 
+    # prepare word cloud data
     word_cloud_data = [
-        {
-            "x": word,
-            "y": count,
-            "color": word_sentiments[word]
-        }
+        {"x": word, "y": count, "color": word_sentiments[word]}
         for word, count in sorted_word_counts
     ]
-    
+
     return {"word_cloud": word_cloud_data}
+
 
 @app.get("/overview", response_model=OverviewResponse)
 @redis_cache("overview", "overview")
 async def get_overview():
-    # Get normalized value counts once
-    status_counts = df['status'].value_counts(normalize=True)
+    global targeted_word
+
+    filtered_df = filter_reviews_by_targeted_word(df, targeted_word)
+
+    status_counts = filtered_df['sentiment'].value_counts(normalize=True)
 
     positive = round(status_counts.get('positive', 0) * 100, 2)
     negative = round(status_counts.get('negative', 0) * 100, 2)
@@ -299,84 +315,54 @@ async def get_overview():
         }
     }
 
+
 @app.get("/time-series", response_model=TimeSeriesResponse)
 @redis_cache("time_series", "time_series")
 async def get_time_series():
+    global targeted_word
+    filtered_df = filter_reviews_by_targeted_word(df, targeted_word)
+
     data = {
         "Positive Review": [0] * 12,
         "Negative Review": [0] * 12,
-        "Neutral Review": [0] * 12
+        "Neutral Review": [0] * 12,
     }
 
-    temp_df = df.copy()
-    temp_df['publishedAtDate'] = pd.to_datetime(temp_df['publishedAtDate'])
+    filtered_df['publishedAtDate'] = pd.to_datetime(filtered_df['publishedAtDate'])
 
-    # Get the current date
     current_date = pd.Timestamp.now()
 
-    # Loop through the last 12 months, starting from the current month
+    # Loop through the last 12 months
     for i in range(12):
-        # Calculate the month and year we are currently working with
+        # Calculate the target year and month
         target_date = current_date - pd.DateOffset(months=i)
         target_year = target_date.year
         target_month = target_date.month
 
-        # Filter the dataframe by both the target month and target year
-        month_df = temp_df[
-            (temp_df['publishedAtDate'].dt.year == target_year) &
-            (temp_df['publishedAtDate'].dt.month == target_month)
+        # Filter the dataframe by target month and year
+        month_df = filtered_df[
+            (filtered_df['publishedAtDate'].dt.year == target_year) &
+            (filtered_df['publishedAtDate'].dt.month == target_month)
         ]
 
-        # Get the count of each review status
-        status_counts = month_df['status'].value_counts()
+        # Count the sentiments
+        status_counts = month_df['sentiment'].value_counts()
 
-        # Update the data dictionary with actual counts
+        # Update the data dictionary with counts
         data["Positive Review"][11 - i] = status_counts.get('positive', 0)
         data["Negative Review"][11 - i] = status_counts.get('negative', 0)
         data["Neutral Review"][11 - i] = status_counts.get('neutral', 0)
 
+    # Prepare the time series data
     time_series_data = [
         TimeSeriesData(
-            name=name, 
+            name=name,
             data=[int(x) for x in data[name]]
         ).model_dump()
         for name in data.keys()
     ]
 
     return {"time_series": time_series_data}
-
-
-
-# @app.get("/time-series", response_model=TimeSeriesResponse)
-# @redis_cache("time_series", "time_series")
-# async def get_time_series():
-#     data = {
-#         "Positive Review": [0] * 12,
-#         "Negative Review": [0] * 12,
-#         "Neutral Review": [0] * 12
-#     }
-
-#     temp_df = df.copy()
-#     temp_df['publishedAtDate'] = pd.to_datetime(temp_df['publishedAtDate'])
-
-#     # only take total score based on generate_month_numbers (current month and 11 months before)
-#     for i, month in enumerate(generate_month_numbers()):
-#         month_df = temp_df[temp_df['publishedAtDate'].dt.month == month]
-#         status_counts = month_df['status'].value_counts(normalize=False)
-
-#         data["Positive Review"][i] = status_counts.get('positive', 0)
-#         data["Negative Review"][i] = status_counts.get('negative', 0)
-#         data["Neutral Review"][i] = status_counts.get('neutral', 0)
-
-#     time_series_data = [
-#         TimeSeriesData(
-#             name=name, 
-#             data=[int(x) for x in data[name]]
-#         ).model_dump()
-#         for name in data.keys()
-#     ]
-
-#     return {"time_series": time_series_data}
 
 
 if __name__ == "__main__":
